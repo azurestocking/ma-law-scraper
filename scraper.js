@@ -1,0 +1,341 @@
+const puppeteer = require('puppeteer');
+const fs = require('fs');
+const path = require('path');
+
+const BASE_URL = 'https://malegislature.gov/Laws/GeneralLaws';
+const OUTPUT_FILE = 'massachusetts_general_laws.json';
+
+// Helper function to delay execution
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Helper functions to parse the text
+function parsePartText(text) {
+    const match = text.match(/Part\s+([IVX]+)\s+(.*?)\s+Chapters\.\s+(\d+-\d+)/);
+    if (match) {
+        return {
+            part: match[1],
+            part_title: match[2].trim()
+        };
+    }
+    return null;
+}
+
+function parseTitleText(text) {
+    const match = text.match(/Title\s+([IVX]+)\s+(.*)/);
+    if (match) {
+        return {
+            title: match[1],
+            title_name: match[2].trim()
+        };
+    }
+    return null;
+}
+
+function parseChapterText(text) {
+    const match = text.match(/Chapter\s+([\dA-Z]+)\s+(.*)/);
+    if (match) {
+        return {
+            chapter: match[1],
+            chapter_title: match[2].trim()
+        };
+    }
+    return null;
+}
+
+// Function to get section links from a chapter page
+async function getSectionLinks(browser, chapterUrl) {
+    const page = await browser.newPage();
+    try {
+        console.log(`Getting sections from: ${chapterUrl}`);
+        await page.goto(chapterUrl, { waitUntil: 'networkidle0' });
+        await delay(1000); // Add small delay to ensure page is fully loaded
+        
+        // Wait for the generalLawsList to be present
+        await page.waitForSelector('ul.generalLawsList', { timeout: 10000 });
+        
+        // Extract section links and their details
+        const sections = await page.evaluate(() => {
+            const sectionElements = document.querySelectorAll('ul.generalLawsList li a');
+            return Array.from(sectionElements).map(element => {
+                const number = element.querySelector('.section')?.textContent.trim() || '';
+                const title = element.querySelector('.sectionTitle')?.textContent.trim() || '';
+                return {
+                    number: number,
+                    title: title,
+                    url: element.href
+                };
+            });
+        });
+        
+        console.log(`Found ${sections.length} sections`);
+        return sections;
+    } catch (error) {
+        console.error('Error getting section links:', error);
+        return [];
+    } finally {
+        await page.close();
+    }
+}
+
+// Function to extract section details
+async function getSectionDetails(browser, sectionUrl, sectionNumber) {
+    const page = await browser.newPage();
+    try {
+        console.log(`Processing section ${sectionNumber}`);
+        await page.goto(sectionUrl, { waitUntil: 'networkidle0' });
+        await delay(1000);
+
+        // Wait for the main content container
+        await page.waitForSelector('.col-xs-12.col-md-8');
+
+        // Extract section title and content
+        const sectionData = await page.evaluate(() => {
+            // Get the section content from the main content area
+            const contentContainer = document.querySelector('.col-xs-12.col-md-8 .col-xs-12');
+            let content = '';
+            
+            if (contentContainer) {
+                // Get all text nodes within the container
+                const walker = document.createTreeWalker(
+                    contentContainer,
+                    NodeFilter.SHOW_TEXT,
+                    null,
+                    false
+                );
+
+                let node;
+                while (node = walker.nextNode()) {
+                    // Skip text in navigation buttons and headers
+                    let parent = node.parentElement;
+                    let isInNavigation = false;
+                    let isInSmall = false;
+                    while (parent) {
+                        if (parent.classList && parent.classList.contains('btn-toolbar')) {
+                            isInNavigation = true;
+                            break;
+                        }
+                        if (parent.tagName === 'SMALL' && parent.closest('.genLawHeading')) {
+                            isInSmall = true;
+                            break;
+                        }
+                        parent = parent.parentElement;
+                    }
+                    
+                    const text = node.textContent.trim();
+                    if (text && !node.parentElement.classList.contains('genLawHeading') && !isInNavigation && !isInSmall) {
+                        content += text + ' ';
+                    }
+                }
+            }
+
+            return {
+                content: content.trim()
+            };
+        });
+
+        return {
+            section: sectionNumber,
+            full_text: sectionData.content,
+            url: sectionUrl
+        };
+    } catch (error) {
+        console.error(`Error processing section ${sectionNumber}:`, error);
+        return {
+            section: sectionNumber,
+            full_text: "",
+            url: sectionUrl
+        };
+    } finally {
+        await page.close();
+    }
+}
+
+async function getParts(browser) {
+    const page = await browser.newPage();
+    try {
+        console.log('Getting parts...');
+        await page.goto(BASE_URL, { waitUntil: 'networkidle0' });
+        await delay(2000); // Wait for any animations to complete
+        
+        await page.waitForSelector('.generalLawsList');
+
+        const parts = await page.evaluate(() => {
+            const partElements = document.querySelectorAll('.generalLawsList > li > a');
+            return Array.from(partElements).map(element => ({
+                part: element.textContent.trim(),
+                part_title: element.getAttribute('title'),
+                url: element.href
+            }));
+        });
+
+        // Parse the part information
+        const parsedParts = parts.map(part => {
+            const match = part.part.match(/Part\s+([IVX]+)\s+(.*?)(?:\s+Chapters\.\s+(\d+-\d+)|$)/);
+            if (match) {
+                return {
+                    part: match[1],
+                    part_title: match[2].trim(),
+                    url: part.url
+                };
+            }
+            return part;
+        });
+
+        console.log(`Found ${parsedParts.length} parts`);
+        return parsedParts;
+    } finally {
+        await page.close();
+    }
+}
+
+async function scrapeLaws() {
+    console.log('Starting to scrape Massachusetts General Laws...');
+    const browser = await puppeteer.launch({
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox']
+    });
+    
+    try {
+        const parts = await getParts(browser);
+        const laws = {
+            parts: []
+        };
+
+        for (const part of parts) {
+            console.log(`\nProcessing ${part.part_title}`);
+            const page = await browser.newPage();
+            
+            try {
+                await page.goto(part.url, { waitUntil: 'networkidle0' });
+                await page.waitForSelector('#accordion');
+                await delay(2000);
+
+                const titleElements = await page.$$('#accordion .panel');
+                const titlesAndChapters = [];
+
+                for (const titleElement of titleElements) {
+                    try {
+                        // Get the title information before clicking
+                        const titleInfo = await page.evaluate((element) => {
+                            const titleLink = element.querySelector('.panel-title a');
+                            const panelHeading = element.querySelector('.panel-heading');
+                            if (!titleLink || !panelHeading) return null;
+
+                            // Extract the title number (Roman numeral) and name
+                            const headingText = panelHeading.textContent.trim();
+                            const titleMatch = headingText.match(/Title\s+([IVX]+)\s+(.*?)(?:\n|$)/);
+                            const titleNumber = titleMatch ? titleMatch[1] : titleLink.textContent.trim();
+                            const titleName = titleMatch ? titleMatch[2].trim() : headingText;
+
+                            return {
+                                title: titleNumber,
+                                title_name: titleName,
+                                onclick: titleLink.getAttribute('onclick')
+                            };
+                        }, titleElement);
+
+                        if (!titleInfo) continue;
+
+                        // Extract the parameters from the onclick handler
+                        const match = titleInfo.onclick.match(/accordionAjaxLoad\('(\d+)',\s*'(\d+)',\s*'([^']+)'\)/);
+                        if (!match) continue;
+
+                        const [_, partId, titleId, titleNum] = match;
+
+                        // Call the accordionAjaxLoad function directly
+                        await page.evaluate((partId, titleId, titleNum) => {
+                            accordionAjaxLoad(partId, titleId, titleNum);
+                        }, partId, titleId, titleNum);
+
+                        // Wait for the chapters to be loaded
+                        await page.waitForFunction(
+                            (element) => {
+                                const list = element.querySelector('.generalLawsList');
+                                return list && list.children.length > 0;
+                            },
+                            { timeout: 10000 },
+                            titleElement
+                        );
+
+                        const titleData = await page.evaluate((element) => {
+                            const headingText = element.querySelector('.panel-heading').textContent.trim();
+                            const titleMatch = headingText.match(/Title\s+([IVX]+)\s+(.*?)(?:\n|$)/);
+                            const titleNumber = titleMatch ? titleMatch[1] : element.querySelector('.panel-title a').textContent.trim();
+                            const titleName = titleMatch ? titleMatch[2].trim() : headingText;
+
+                            const title = {
+                                title: titleNumber,
+                                title_name: titleName,
+                                chapters: []
+                            };
+
+                            const chapterElements = element.querySelectorAll('.generalLawsList a');
+                            chapterElements.forEach(chapterElement => {
+                                title.chapters.push({
+                                    chapter: chapterElement.textContent.trim(),
+                                    chapter_title: chapterElement.getAttribute('title') || chapterElement.textContent.trim(),
+                                    url: chapterElement.href
+                                });
+                            });
+
+                            return title;
+                        }, titleElement);
+
+                        if (titleData) {
+                            // For each chapter, get its sections
+                            for (const chapter of titleData.chapters) {
+                                console.log(`\nProcessing sections for Chapter ${chapter.chapter}`);
+                                const sections = await getSectionLinks(browser, chapter.url);
+                                
+                                // Get details for each section
+                                const processedSections = [];
+                                for (const section of sections) {
+                                    const sectionData = await getSectionDetails(browser, section.url, section.number);
+                                    processedSections.push({
+                                        section: section.number,
+                                        section_title: section.title,
+                                        full_text: sectionData.full_text,
+                                        url: section.url
+                                    });
+                                    await delay(500);
+                                }
+                                
+                                // Add sections to the chapter
+                                chapter.sections = processedSections;
+                            }
+
+                            titlesAndChapters.push(titleData);
+                            console.log(`Found ${titleData.chapters.length} chapters in Title ${titleData.title}`);
+                        }
+                    } catch (error) {
+                        console.log(`Error processing title: ${error.message}`);
+                        continue;
+                    }
+                }
+
+                const partData = {
+                    ...part,
+                    titles: titlesAndChapters
+                };
+
+                laws.parts.push(partData);
+                
+                // Save progress after each part
+                fs.writeFileSync(OUTPUT_FILE, JSON.stringify(laws, null, 2));
+                console.log(`Saved progress for ${part.part_title}`);
+            } finally {
+                await page.close();
+            }
+        }
+
+        console.log('\nScraping completed!');
+        console.log(`Total parts processed: ${laws.parts.length}`);
+        console.log(`Results saved to ${OUTPUT_FILE}`);
+    } catch (error) {
+        console.error('Error during scraping:', error);
+    } finally {
+        await browser.close();
+    }
+}
+
+scrapeLaws(); 
