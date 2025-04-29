@@ -1,0 +1,14 @@
+{
+  "name": "ma-law-scraper",
+  "version": "1.0.0",
+  "description": "Massachusetts General Laws Chapter 186 Scraper",
+  "main": "chapter-scraper.js",
+  "scripts": {
+    "start": "node chapter-scraper.js"
+  },
+  "dependencies": {
+    "axios": "^1.9.0",
+    "cheerio": "^1.0.0",
+    "puppeteer": "^24.7.2"
+  }
+} 
